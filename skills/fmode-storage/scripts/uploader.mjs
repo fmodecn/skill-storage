@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-#!/usr/bin/env node
 /**
  * fmode-storage uploader — 对象存储上传/公开链接/ACL
  * 零依赖（Node ≥18）。凭据按 4 级优先级自动解析，永不入库。
