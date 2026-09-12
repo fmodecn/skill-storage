@@ -21,7 +21,36 @@ const HOME = os.homedir();
 
 // fmode 网关基址（签发 STS / 下载 URL）
 const FMODE_API_BASE = process.env.FMODE_API_BASE || 'https://server.fmode.cn';
+// 自举 v2（权威，2026-09 实测可用）：sessionToken + projectId → STS
+// 见 fmode-studio rules/09 §4.3.4 与 future-server api/api-ncloud/apig/routes-deploy.js
+const DEPLOY_STS_URL = `${FMODE_API_BASE.replace(/\/$/, '')}/api/apig/deploy/huaweicloud`;
+// 自举 v1（历史设计，端点可能未部署；失败自动回落 v2）
 const STORAGE_CREDENTIALS_URL = `${FMODE_API_BASE.replace(/\/$/, '')}/api/storage/credentials`;
+
+/**
+ * 解析 storage 专用 projectId（非密钥）。
+ * 来源优先级：FMODE_STORAGE_PROJECT_ID 环境变量
+ *   → ~/.fmode/config.json 的 storageProjectId
+ *   → ~/.fmode/config/user.json 的 storageProjectId
+ *   → ./.fmode/deploy.json 的 projectId（当前项目自己的发布身份）
+ */
+export function resolveStorageProjectId() {
+  if (process.env.FMODE_STORAGE_PROJECT_ID) return process.env.FMODE_STORAGE_PROJECT_ID.trim();
+  const candidates = [
+    path.join(HOME, '.fmode', 'config.json'),
+    path.join(HOME, '.fmode', 'config', 'user.json'),
+    path.join(process.cwd(), '.fmode', 'deploy.json'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const j = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^﻿/, ''));
+      const id = j.storageProjectId || j.projectId || null;
+      if (id && String(id).trim()) return String(id).trim();
+    } catch { /* try next source */ }
+  }
+  return null;
+}
 
 /**
  * 第0级：解析 sessionToken。
@@ -32,10 +61,11 @@ const STORAGE_CREDENTIALS_URL = `${FMODE_API_BASE.replace(/\/$/, '')}/api/storag
  */
 export function resolveSessionToken() {
   if (process.env.FMODE_SESSION_TOKEN) return process.env.FMODE_SESSION_TOKEN.trim();
+  // user.json 优先：登录流程（07-git「平台 sessionToken 失效恢复」）写入的最新 token
   const candidates = [
+    path.join(HOME, '.fmode', 'config', 'user.json'),
     path.join(HOME, '.fmode', 'config.json'),
     path.join(process.cwd(), '.fmode', 'config.json'),
-    path.join(HOME, '.fmode', 'config', 'user.json'),
   ];
   for (const p of candidates) {
     try {
@@ -92,6 +122,42 @@ export async function fetchStsCredentials(sessionToken) {
 }
 
 /**
+ * 自举 v2（权威链路）：sessionToken + projectId → POST /api/apig/deploy/huaweicloud → STS。
+ * 服务端用平台自己的华为云授权签发项目隔离短时 STS，目标固定为
+ *   obs://nova-cloud/dev/<projectId>/（bucket=nova-cloud, prefix=dev/<projectId>/）。
+ * 返回字段映射：data.accessKey→ak, data.secretKey→sk, data.securityToken→securityToken,
+ * data.obsPath→bucket/prefix 解析。成功返回对象，失败返回 null（调用方回落）。
+ */
+export async function fetchStsViaDeploy(sessionToken, projectId) {
+  if (!sessionToken || !projectId) return null;
+  try {
+    const res = await fetch(DEPLOY_STS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: sessionToken, projectId }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => null);
+    const data = body && body.data;
+    if (!body || body.code !== 200 || !data || !data.success) return null;
+    const obsPath = String(data.obsPath || '');           // 例: obs://nova-cloud/dev/<projectId>/
+    const m = obsPath.match(/^obs:\/\/([^/]+)\/(.*)\/$/);
+    return {
+      ak: String(data.accessKey || ''),
+      sk: String(data.secretKey || ''),
+      securityToken: String(data.securityToken || ''),
+      expiresAt: data.expiresAt || null,
+      endpoint: 'obs.cn-south-1.myhuaweicloud.com',
+      bucket: m ? m[1] : 'nova-cloud',
+      prefix: m ? m[2] : '',
+      projectId,
+    };
+  } catch { /* 网络失败一律回落，不泄露错误细节 */ }
+  return null;
+}
+
+/**
  * 用 STS 临时凭证构造一次性 obsutil 配置目录，执行命令后即删。
  * 配置只写进临时目录（0700），命令结束立即删除——STS 不落盘留存、不进日志。
  *
@@ -133,19 +199,32 @@ export async function resolveStorageConfig() {
     sts: null,       // 第0级自举得到的 STS（内存持有）
     via: null,       // 命中的解析级别（诊断用，不含任何密钥）
   };
-  // ---- 第0级自举：sessionToken → STS ----
+  // ---- 第0级自举 v2（权威）：sessionToken + projectId → deploy/huaweicloud → STS ----
   const sessionToken = resolveSessionToken();
   if (sessionToken) {
-    const sts = await fetchStsCredentials(sessionToken);
-    if (sts) {
-      cfg.sts = sts;
-      cfg.bucket = sts.bucket || cfg.bucket;
-      cfg.endpoint = sts.endpoint || cfg.endpoint;
-      cfg.via = 'level0:sessionToken->STS';
-      return cfg; // 自举成功，无需回落
+    const projectId = resolveStorageProjectId();
+    if (projectId) {
+      const sts = await fetchStsViaDeploy(sessionToken, projectId);
+      if (sts) {
+        cfg.sts = sts;
+        cfg.bucket = sts.bucket || cfg.bucket;
+        cfg.endpoint = sts.endpoint || cfg.endpoint;
+        cfg.cdnDomain = process.env.FMODE_CDN_DOMAIN || 'app.fmode.cn';
+        cfg.via = 'level0v2:sessionToken+projectId->deploySTS';
+        return cfg; // 自举成功，无需回落
+      }
     }
-    // sessionToken 存在但换取失败：给出明确报错指向重新登录
-    console.error('sessionToken 存在但 STS 换取失败——sessionToken 缺失或失效，请重新登录 FMODE Studio 或配置 FMODE_SESSION_TOKEN');
+    // v2 未命中（无 projectId 或签发失败）→ v1 历史端点
+    const sts1 = await fetchStsCredentials(sessionToken);
+    if (sts1) {
+      cfg.sts = sts1;
+      cfg.bucket = sts1.bucket || cfg.bucket;
+      cfg.endpoint = sts1.endpoint || cfg.endpoint;
+      cfg.via = 'level0v1:sessionToken->STS';
+      return cfg;
+    }
+    // sessionToken 存在但两条链路都失败：给出明确报错指向重新登录
+    console.error('sessionToken 存在但 STS 换取失败（v2 deploy 与 v1 credentials 均未命中）——sessionToken 失效或缺少 storageProjectId 配置');
     console.error('（将继续尝试第1-4级回落配置）');
   }
   // ---- 第1级：环境变量 ----
@@ -179,6 +258,16 @@ export function publicUrl(cfg, key) {
   return `https://${cfg.bucket}.${cfg.endpoint}/${key}`.replace('.myhuaweicloud.com', '.myhuaweicloud.com');
 }
 
+/** v2 STS 的 key 必须限定在签发的 prefix 内（dev/<projectId>/...），防止越权路径 */
+function scopedKey(cfg, key) {
+  if (cfg.sts && cfg.sts.prefix) {
+    const pfx = cfg.sts.prefix.endsWith('/') ? cfg.sts.prefix : cfg.sts.prefix + '/';
+    if (key.startsWith(pfx)) return key;
+    return pfx + key.replace(/^\/+/, '');
+  }
+  return key;
+}
+
 function obs(args, cfg, timeout = 120000) {
   // 第0级命中 → STS 一次性临时配置执行（不落盘留存）
   if (cfg.sts) return runWithSts(cfg.sts, args, timeout);
@@ -204,6 +293,7 @@ async function main() {
     if (!file || !key) { console.error('用法: put <file> --key <objectKey> [--acl public-read]'); process.exit(2); }
     const acl = arg('--acl') || 'public-read';
     const bucketArg = arg('--bucket'); if (bucketArg) cfg.bucket = bucketArg;
+    key = scopedKey(cfg, key); // v2 STS: 强制限定 dev/<projectId>/ 前缀
     const r = obs(['cp', file, `obs://${cfg.bucket}/${key}`], cfg);
     if (!r.ok) { console.error('上传失败:', r.out.slice(-300)); process.exit(1); }
     console.log(JSON.stringify({ ok: true, key, url: publicUrl(cfg, key), bucket: cfg.bucket, via: cfg.via }, null, 2));
@@ -225,7 +315,8 @@ async function main() {
       cdnDomain: cfg.cdnDomain,
       stsBootstrapped: Boolean(cfg.sts),
       stsPrefix: cfg.sts ? cfg.sts.prefix : null,
-      stsExpiresInMemoryOnly: Boolean(cfg.sts),
+      stsProjectId: cfg.sts && cfg.sts.projectId ? cfg.sts.projectId : null,
+      stsExpiresAt: cfg.sts && cfg.sts.expiresAt ? cfg.sts.expiresAt : null,
     }, null, 2));
     return;
   }
