@@ -1,7 +1,7 @@
 {
   "name": "fmode-storage",
-  "version": "0.2.1",
-  "description": "Claude Code skill: 录音文件转写（讯飞 LFASR）通过 Fmode 网关 /api/listen/transcribe 完成。讯飞凭据仅服务端持有，客户端只需 fmode token，服务端按音频时长计费。提供 `npx fmode-listen transcribe` 直连命令 + Claude Code 技能安装器。",
+  "version": "0.3.0",
+  "description": "Claude Code skill: 对象存储上传/公开链接/ACL（华为云 OBS / S3 兼容）。诚实 4 级凭据链（env → obsutil config → 平台签发(端点上线后) → 项目 config）+ init 初始化向导 + test 自检。零依赖 Node ≥18。",
   "license": "MIT",
   "repository": {
     "type": "git",

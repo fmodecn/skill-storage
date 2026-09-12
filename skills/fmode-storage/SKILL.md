@@ -1,47 +1,56 @@
 ---
 name: fmode-storage
-description: "把二进制大文件（图片/音频/视频/HTML 报告）上传到对象存储（OBS/S3），本地零长期占用，生成公开分享链接。适用：(1) 报告/课件发布即分享 (2) 图片/音视频素材托管 (3) 批量上传+ACL 设置 (4) 需要公开 URL 供转发或嵌入。第0级 sessionToken 自举换 STS 直传，无需预配 OBS 密钥。"
-description_en: "Upload binary files (images/audio/video/HTML reports) to object storage (OBS/S3), keep local disk clean, and get public share URLs instantly. Use for publishing reports/courseware, hosting media assets, batch upload with ACL, or any scenario needing public URLs. Level-0 sessionToken bootstraps STS — no pre-configured OBS keys needed."
+description: "把二进制大文件（图片/音频/视频/HTML 报告）上传到对象存储（OBS/S3），本地零长期占用，生成公开分享链接。适用：(1) 报告/课件发布即分享 (2) 图片/音视频素材托管 (3) 批量上传+ACL 设置 (4) 需要公开 URL 供转发或嵌入。首次使用先跑 init 向导一次性配置 OBS 子账号 AK/SK。"
+description_en: "Upload binary files (images/audio/video/HTML reports) to object storage (OBS/S3), keep local disk clean, and get public share URLs instantly. Use for publishing reports/courseware, hosting media assets, batch upload with ACL, or any scenario needing public URLs. Run the init wizard once to configure an OBS sub-account AK/SK."
 ---
 
 # Fmode Storage — 对象存储与公开分享技能
 
 ## Overview
 
-本技能把本地二进制文件交给对象存储（默认华为云 OBS，S3 协议兼容），生成公开 URL 供分享、转发或嵌入。设计原则：**本地零长期占用**——大文件直接上云；**公开即所得**——上传后立即可访问的 URL；**凭据零入库**——STS 临时凭证仅内存持有，AK/SK 长期密钥只在 obsutil/环境配置里。
+本技能把本地二进制文件交给对象存储（默认华为云 OBS，S3 协议兼容），生成公开 URL 供分享、转发或嵌入。设计原则：**本地零长期占用**——大文件直接上云；**公开即所得**——上传后立即可访问的 URL；**凭据零入库**——AK/SK 长期密钥只在 obsutil/环境配置里，诊断输出绝不含密钥本体；**诚实失败**——凭据链全失败时打印初始化向导并退出码 2，绝不伪装成功。
+
+## 三分钟初始化（新用户）
+
+```bash
+# 1. 向 Fmode 平台/管理员申请 OBS 子账号 AK/SK（邮件模板见 README.md）
+node <skill_dir>/scripts/uploader.mjs init --ak <AK> --sk <SK> \
+  --endpoint obs.cn-north-4.myhuaweicloud.com --bucket <bucket>
+#    （省略参数则交互询问）写 obsutil config(600)+技能 config 段，自动 test
+
+# 2. 验证
+node <skill_dir>/scripts/uploader.mjs test
+# → 上传 1KB 探针文件→删除→{ "ok": true, ... }
+```
 
 ## 快速用
 
 ```bash
-node <skill_dir>/scripts/uploader.mjs put ./report.html --key reports/20260911/report.html
-# → { "url": "https://fmode.cn/reports/20260911/report.html", "via": "level0:sessionToken->STS", ... }
+node <skill_dir>/scripts/uploader.mjs put ./report.html --key reports/20260912/report.html
+# → { "url": "https://<bucket>.<endpoint>/reports/20260912/report.html", "via": "level2:obsutilconfig(...)", ... }
 
 node <skill_dir>/scripts/uploader.mjs setacl --key reports/ --acl public-read -r
 ```
 
-## 凭据（第0级自举 + 4 级回落）
+## 凭据（诚实 4 级 + 端点探测）
 
 ```
-┌─ 第0级（自举，推荐）──────────────────────────────────────────┐
-│ FMODE_SESSION_TOKEN 或 ~/.fmode/config.json 的 sessionToken    │
-│   → POST https://server.fmode.cn/api/storage/credentials      │
-│   → STS 临时凭证 {AK, SK, SecurityToken}（限用户 prefix，短时）│
-│   → 一次性 obsutil 临时配置直传 OBS（命令结束即删，不落盘）    │
-└───────────────────────────────────────────────────────────────┘
-┌─ 回落（自建 OBS / 已有 obsutil config 的用户）────────────────┐
-│ 1. 环境变量 FMODE_OBS_CONF（JSON 配置文件路径）                │
-│ 2. ~/.fmode/config.json → obsBucket/obsEndpoint/cdnDomain     │
-│ 3. 项目 ./.fmode/config.json → 同上                           │
-│ 4. obsutil 默认链（已 obsutil config 则自动探测 bucket）       │
-└───────────────────────────────────────────────────────────────┘
+┌─ 诚实 4 级（命中即用，全失败→打印初始化向导并 exit 2）────────────────────┐
+│ 1. 环境变量 OBS_AK/OBS_SK(/OBS_ENDPOINT/OBS_BUCKET)                       │
+│ 2. obsutil config 文件（OBSUTIL_CONFIG 或 ~/.obsutilconfig，含 getpwuid   │
+│    home 变体）→ AK/SK/endpoint；bucket 缺失时 `obsutil ls` 自动探测       │
+│ 3. ~/.fmode/config/user.json 的 fmodeApiToken → 平台签发接口              │
+│    （HEAD 探测 /api/storage/credentials，缓存 .sts-probe.json 1 小时：    │
+│     404=未上线→打印提示并跳过，不空转）                                    │
+│ 4. 项目级 ./.fmode/config.json（obsBucket/obsEndpoint/cdnDomain）         │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- 第0级命中时**无需任何 OBS 密钥预配置**——登录 FMODE Studio 即可上传。
-- STS 临时凭证：**内存持有，禁落盘、禁日志**；`runWithSts()` 用临时目录（0700）承载配置，命令结束立即删除。
-- 换取失败报错：`sessionToken 缺失或失效，请重新登录 FMODE Studio 或配置 FMODE_SESSION_TOKEN`，随后自动回落第1-4级。
-- 自建 OBS 用户保持原链路不变（第1-4级不受影响）。
+- **平台 STS 签发端点目前未上线（探测 404，设计文档 04-API设计.md 状态"规划中"）**。旧版"sessionToken→STS 免配置自举"是伪自举（端点 404 从未通过），0.3.0 已诚实化：代码保留为 `--experimental-sts`，仅端点探测 200 时启用，默认关闭。端点上线后一行配置恢复。
+- **当前版本需一次性配置 AK/SK**（init 向导）；sessionToken 免配置自举待平台端点上线。
+- AK/SK 只存在于 obsutil config / 环境变量（用户自己配的）；`config` 命令输出不含任何密钥本体。
 
-> 自建 OBS 一次性配置：`obsutil config -i=<AK> -k=<SK> -e=obs.cn-south-1.myhuaweicloud.com`
+> 自建 OBS 一次性配置：`obsutil config -i=<AK> -k=<SK> -e=obs.cn-north-4.myhuaweicloud.com`
 > **禁止把 AK/SK、sessionToken、STS 或任何密钥写进仓库、日志或对话。**
 
 ## 何时用
@@ -52,4 +61,4 @@ node <skill_dir>/scripts/uploader.mjs setacl --key reports/ --acl public-read -r
 
 ## 详细文档
 
-见仓库根 `README.md`（多工具安装：Claude Code / Codex / Gemini CLI / WorkBuddy / Hermes）。
+见仓库根 `README.md`（三分钟初始化 + 多工具安装：Claude Code / Codex / Gemini CLI / WorkBuddy / Hermes + 完整 changelog）。
