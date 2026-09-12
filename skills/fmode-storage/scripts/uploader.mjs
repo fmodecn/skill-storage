@@ -10,8 +10,11 @@
  *
  *   第1级 环境变量 OBS_AK/OBS_SK(/OBS_ENDPOINT/OBS_BUCKET)
  *   第2级 obsutil config 文件（OBSUTIL_CONFIG 或 ~/.obsutilconfig）解析 AK/SK/endpoint/bucket
- *   第3级 ~/.fmode/config/user.json 的 fmodeApiToken → 平台签发接口
- *         （启动时 HEAD 探测该端点：404=未上线→跳过并提示；200=启用自举）
+ *   第1级 环境变量 OBS_AK/OBS_SK(/OBS_ENDPOINT/OBS_BUCKET)
+ *   第2级 obsutil config 文件（OBSUTIL_CONFIG 或 ~/.obsutilconfig）解析 AK/SK/endpoint/bucket
+ *   第3级 sessionToken + storageProjectId → POST /api/apig/deploy/huaweicloud
+ *         → 项目隔离 STS（权威端点，生产实测 200；/api/storage/credentials
+ *           设计端点从未上线——HEAD 探测 404 缓存于 .sts-probe.json）
  *   第4级 项目级 ./.fmode/config.json
  *   全失败：打印初始化向导指引并退出码 2，绝不伪装成功。
  *
@@ -37,6 +40,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // fmode 网关基址（平台 STS 签发端点所在）
 const FMODE_API_BASE = process.env.FMODE_API_BASE || 'https://server.fmode.cn';
 const STORAGE_CREDENTIALS_URL = `${FMODE_API_BASE.replace(/\/$/, '')}/api/storage/credentials`;
+// 自举权威端点（2026-09-12 生产实测 200）：sessionToken + projectId → 项目隔离 STS
+const DEPLOY_STS_URL = `${FMODE_API_BASE.replace(/\/$/, '')}/api/apig/deploy/huaweicloud`;
 const DEFAULT_ENDPOINT = 'obs.cn-north-4.myhuaweicloud.com';
 const PROBE_CACHE_FILE = path.join(__dirname, '.sts-probe.json'); // 探测结果缓存（1 小时有效）
 const PROBE_TTL_MS = 60 * 60 * 1000;
@@ -94,16 +99,15 @@ function invalidateProbeCache() {
 // ============================================================================
 
 /**
- * 解析 sessionToken（优先级：FMODE_SESSION_TOKEN → ~/.fmode config 文件）。
- * 注意：真实身份字段是 fmodeApiToken（sk- 开头），本函数仅在
- * --experimental-sts 且端点探测 200 时被调用，面向未来端点上线。
+ * 解析 sessionToken（优先级：FMODE_SESSION_TOKEN → user.json（登录流程写入的最新 token）
+ * → ~/.fmode/config.json → ./.fmode/config.json）。
  */
 export function resolveSessionToken() {
   if (process.env.FMODE_SESSION_TOKEN) return process.env.FMODE_SESSION_TOKEN.trim();
   const candidates = [
+    path.join(HOME, '.fmode', 'config', 'user.json'),
     path.join(HOME, '.fmode', 'config.json'),
     path.join(process.cwd(), '.fmode', 'config.json'),
-    path.join(HOME, '.fmode', 'config', 'user.json'),
   ];
   for (const p of candidates) {
     try {
@@ -117,7 +121,69 @@ export function resolveSessionToken() {
 }
 
 /**
- * sessionToken → STS 临时凭证。⚠️ 端点未上线（404）前必然返回 null。
+ * 解析 storage 专用 projectId（非密钥）。来源优先级：FMODE_STORAGE_PROJECT_ID 环境变量
+ * → ~/.fmode/config.json / user.json 的 storageProjectId → ./.fmode/deploy.json 的 projectId。
+ */
+export function resolveStorageProjectId() {
+  if (process.env.FMODE_STORAGE_PROJECT_ID) return process.env.FMODE_STORAGE_PROJECT_ID.trim();
+  const candidates = [
+    path.join(HOME, '.fmode', 'config.json'),
+    path.join(HOME, '.fmode', 'config', 'user.json'),
+    path.join(process.cwd(), '.fmode', 'deploy.json'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const j = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^﻿/, ''));
+      const id = j.storageProjectId || j.projectId || null;
+      if (id && String(id).trim()) return String(id).trim();
+    } catch { /* try next source */ }
+  }
+  return null;
+}
+
+/**
+ * 第3级（权威，2026-09-12 生产实测 200）：sessionToken + projectId → 项目隔离 STS。
+ *
+ * 权威链路（future-server api/api-ncloud/apig/routes-deploy.js）：
+ *   POST /api/apig/deploy/huaweicloud {token, projectId}
+ *     → { code:200, data:{ accessKey, secretKey, securityToken, obsPath } }
+ *     → obsPath "obs://nova-cloud/dev/<projectId>/" 解析出 bucket/prefix
+ * 服务端权限：token→用户身份 → Project.user / Project.owner / ProjectTeam 三查。
+ * ⚠️ 返回的 STS 仅内存持有：不写文件、不打日志、不进错误信息。
+ */
+export async function fetchStsViaDeploy(sessionToken, projectId) {
+  if (!sessionToken || !projectId) return null;
+  try {
+    const res = await fetch(DEPLOY_STS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: sessionToken, projectId }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => null);
+    const data = body && body.data;
+    if (!body || body.code !== 200 || !data || !data.success) return null;
+    const obsPath = String(data.obsPath || '');
+    const m = obsPath.match(/^obs:\/\/([^/]+)\/(.*)\/$/);
+    return {
+      ak: String(data.accessKey || ''),
+      sk: String(data.secretKey || ''),
+      securityToken: String(data.securityToken || ''),
+      expiresAt: data.expiresAt || null,
+      projectId,
+      // nova-cloud 桶在 cn-south-1（实测 2026-09-12；north-4 会 NoSuchBucket）
+      endpoint: 'obs.cn-south-1.myhuaweicloud.com',
+      bucket: m ? m[1] : 'nova-cloud',
+      prefix: m ? m[2] + '/' : `dev/${projectId}/`,
+    };
+  } catch { return null; }
+}
+
+/**
+ * 备用（任务书 B 节预留）：设计文档端点 /api/storage/credentials。
+ * ⚠️ 该端点从未上线（HEAD 探测 404），端点上线前必然返回 null。仅 --experimental-sts 时调用。
  * 返回的 STS 仅内存持有：不写文件、不打日志、不进错误信息。
  */
 export async function fetchStsCredentials(sessionToken) {
@@ -142,6 +208,16 @@ export async function fetchStsCredentials(sessionToken) {
       prefix: cred.prefix || '',
     };
   } catch { return null; }
+}
+
+/** STS 签发作用域限定 key 必须在 prefix 内（dev/<projectId>/...），防越权路径 */
+export function scopedKey(cfg, key) {
+  if (cfg.sts && cfg.sts.prefix) {
+    const pfx = cfg.sts.prefix.endsWith('/') ? cfg.sts.prefix : cfg.sts.prefix + '/';
+    if (key.startsWith(pfx)) return key;
+    return pfx + key.replace(/^\/+/, '');
+  }
+  return key;
 }
 
 /**
@@ -237,8 +313,7 @@ function findObsutil() {
  * 诚实 4 级凭据解析（命中即用，检测不到就换下一级）：
  *   第1级 环境变量 OBS_AK/OBS_SK(/OBS_ENDPOINT/OBS_BUCKET)
  *   第2级 obsutil config 文件（OBSUTIL_CONFIG 或 ~/.obsutilconfig）
- *   第3级 ~/.fmode/config/user.json 的 fmodeApiToken → 平台签发接口
- *         （先 HEAD 探测端点：404=未上线→跳过并提示，不空转）
+ *   第3级 sessionToken + storageProjectId → deploy STS（端点探测见 fetchStsCredentials 注释）
  *   第4级 项目级 ./.fmode/config.json
  */
 export async function resolveStorageConfig({ experimentalSts = false } = {}) {
@@ -280,31 +355,47 @@ export async function resolveStorageConfig({ experimentalSts = false } = {}) {
     }
   }
 
-  // ---- 第3级：fmodeApiToken → 平台签发接口（端点未上线则跳过并提示）----
+  // ---- 第3级：平台签发 STS（deploy 权威链路，2026-09-12 生产实测 200）----
+  // sessionToken + storageProjectId → POST /api/apig/deploy/huaweicloud → 项目隔离 STS
+  // （设计文档中的 /api/storage/credentials 从未上线——HEAD 探测 404，.sts-probe.json 缓存；
+  //   端点若上线，见 fetchStsCredentials 的备用实现，仅 --experimental-sts 启用）
   if (!cfg.ak) {
-    const userCfg = path.join(HOME, '.fmode', 'config', 'user.json');
-    const token = (() => {
-      try {
-        const j = JSON.parse(fs.readFileSync(userCfg, 'utf8').replace(/^﻿/, ''));
-        return (j.fmodeApiToken || '').trim() || null;
-      } catch { return null; }
-    })();
-    if (token) {
+    const sessionToken = resolveSessionToken();
+    if (sessionToken) {
+      const projectId = resolveStorageProjectId();
+      const sts = projectId ? await fetchStsViaDeploy(sessionToken, projectId) : null;
+      if (sts) {
+        // deploy 端点已实测 200（区别于 storage/credentials 的伪自举），默认启用；
+        // --experimental-sts 仅控制旧 storage/credentials 备用路径
+        cfg.sts = sts;
+        cfg.bucket = sts.bucket || cfg.bucket;
+        cfg.endpoint = sts.endpoint || cfg.endpoint;
+        cfg.cdnDomain = process.env.FMODE_CDN_DOMAIN || 'app.fmode.cn';
+        cfg.via = 'level3:sessionToken+projectId->deploySTS';
+        return cfg;
+      }
+      if (!projectId) {
+        console.error('sessionToken 存在但缺少 storageProjectId——请设置 FMODE_STORAGE_PROJECT_ID 或在 ~/.fmode/config.json 配 storageProjectId（须为本人有权限的 Project objectId）');
+      } else {
+        console.error('sessionToken 存在但 STS 签发失败（/api/apig/deploy/huaweicloud 未 200）——token 失效或该 projectId 不属于当前用户');
+      }
+      console.error('（将继续尝试第4级回落配置）');
+    } else {
+      // 无 sessionToken：检查设计文档端点是否上线（任务书 B 节：诚实探测，缓存 1 小时）
       const probe = await probeStsEndpoint();
-      if (!probe.online) {
-        console.error(`平台 STS 签发端点未上线（探测 ${STORAGE_CREDENTIALS_URL} → ${probe.status ?? '网络失败'}；设计文档 fmode-studio/docs/obs-cdn/04-API设计.md 状态"规划中"），暂用 obsutil 配置模式`);
-      } else if (experimentalSts) {
-        const sts = await fetchStsCredentials(token);
+      if (probe.online && experimentalSts) {
+        const token = resolveSessionToken() || process.env.FMODE_API_TOKEN || null;
+        const sts = token ? await fetchStsCredentials(token) : null;
         if (sts) {
           cfg.sts = sts;
-          cfg.endpoint = sts.endpoint || cfg.endpoint;
           cfg.bucket = sts.bucket || cfg.bucket;
-          cfg.via = 'level3:experimental-sts';
+          cfg.endpoint = sts.endpoint || cfg.endpoint;
+          cfg.via = 'level3:experimental-storage-credentials';
           return cfg;
         }
-        console.error('--experimental-sts 已启用且端点在线，但换取失败：token 缺失或失效');
-      } else {
-        console.error('平台 STS 端点已上线。加 --experimental-sts 启用 sessionToken 自举（或等待默认开启）。');
+        console.error('--experimental-sts 已启用且设计端点在线，但换取失败');
+      } else if (probe.online) {
+        console.error('平台 STS 设计端点已上线（/api/storage/credentials）。加 --experimental-sts 启用该自举路径，或继续用 deploy/obsutil 配置模式。');
       }
     }
   }
@@ -424,7 +515,7 @@ async function main() {
   const cfg = await resolveStorageConfig({ experimentalSts });
   if (!cfg.ak && !cfg.sts) {
     if (cmd !== 'help') {
-      console.error('凭据链 4 级全部未命中（env → obsutil config → 平台签发(未上线) → 项目 config）。');
+      console.error('凭据链 4 级全部未命中（env → obsutil config → 平台签发(sessionToken+projectId) → 项目 config）。');
       printWizard();
       process.exit(2);
     }
@@ -443,6 +534,7 @@ async function main() {
     if (!file || !key) { console.error('用法: put <file> --key <objectKey> [--acl public-read]'); process.exit(2); }
     const acl = arg('--acl') || 'public-read';
     const bucketArg = arg('--bucket'); if (bucketArg) cfg.bucket = bucketArg;
+    key = scopedKey(cfg, key); // STS 签发时强制限定 dev/<projectId>/ 前缀，防越权路径
     const r = obs(['cp', file, `obs://${cfg.bucket}/${key}`, ...(acl ? ['-acl', acl] : [])]);
     if (!r.ok) { console.error('上传失败:', r.out.slice(-300)); process.exit(1); }
     console.log(JSON.stringify({ ok: true, key, url: publicUrl(cfg, key), bucket: cfg.bucket, via: cfg.via }, null, 2));
@@ -464,8 +556,10 @@ async function main() {
       endpoint: cfg.endpoint,
       cdnDomain: cfg.cdnDomain,
       credentialsResolved: Boolean(cfg.ak || cfg.sts),
-      stsExperimental: Boolean(cfg.sts),
+      stsBootstrapped: Boolean(cfg.sts),
       stsPrefix: cfg.sts ? cfg.sts.prefix : null,
+      stsProjectId: cfg.sts && cfg.sts.projectId ? cfg.sts.projectId : null,
+      stsExpiresAt: cfg.sts && cfg.sts.expiresAt ? cfg.sts.expiresAt : null,
     }, null, 2));
     return;
   }

@@ -73,16 +73,21 @@ cp -r skill-storage/skills/fmode-storage <你的工具技能目录>/fmode-storag
 第2级: obsutil config 文件（OBSUTIL_CONFIG 环境变量 或 ~/.obsutilconfig，
        含 getpwuid home 变体）——解析出 AK/SK/endpoint，bucket 缺失时用
        `obsutil ls` 自动探测
-第3级: ~/.fmode/config/user.json 的 fmodeApiToken → 平台签发接口
-       （启动时 HEAD 探测 ${FMODE_API_BASE}/api/storage/credentials 并缓存
-       .sts-probe.json 1 小时：404=未上线 → 打印"平台 STS 签发端点未上线
-       (设计文档 04-API设计.md), 暂用 obsutil 配置模式"并跳过，不空转）
+第3级: 平台签发 STS（sessionToken + storageProjectId，deploy 权威端点生产实测 200）
+       → POST /api/apig/deploy/huaweicloud {token, projectId}
+       → STS 临时凭证 {accessKey, secretKey, securityToken, obsPath}
+         obsPath = obs://nova-cloud/dev/<projectId>/（项目隔离前缀，key 强制限定）
+       → 一次性 obsutil 临时配置直传 OBS（STS 仅内存持有，用完即删）
+       projectId 来源：FMODE_STORAGE_PROJECT_ID → ~/.fmode/config.json 的
+       storageProjectId → user.json → ./.fmode/deploy.json 的 projectId
+       （设计文档中的 /api/storage/credentials 从未上线：HEAD 探测 404，缓存
+         .sts-probe.json 1 小时；上线后 --experimental-sts 启用该备用路径）
 第4级: 项目级 ./.fmode/config.json（obsBucket/obsEndpoint/cdnDomain）
 ```
 
-- **平台 STS 签发端点目前未上线（探测 404）**。旧版"sessionToken→STS 自举"声称"登录即可上传"属伪自举，0.3.0 已诚实化：代码保留，仅在显式传 `--experimental-sts` 且端点探测 200 时启用（面向未来上线）。B 节接口上线后一行配置恢复。
+- **旧版 0.2.x 的"sessionToken→/api/storage/credentials 自举"是伪自举**：该端点从未上线（探测 404，设计文档 `fmode-studio/docs/obs-cdn/04-API设计.md` 状态"规划中"），"登录即可上传"从未真正通过。0.3.0 诚实化：该路径降级为 `--experimental-sts`（探测 200 才启用）；第3级改用真实上线的 deploy STS 端点。
 - **AK/SK 长期密钥只存在于 obsutil config / 环境变量**（用户自己配的）；`config` 命令诊断输出绝不含任何密钥本体。
-- **当前版本需一次性配置 AK/SK**（见顶部"三分钟初始化"）；sessionToken 免配置自举待平台端点上线。
+- **当前版本需一次性配置 AK/SK**（见顶部"三分钟初始化"）；deploy STS 自举需登录 FMODE Studio 获得 sessionToken + 配置 storageProjectId（免 OBS 密钥，但需 projectId）。
 
 > 自建 OBS 配置方法（一次性，第2级）：`obsutil config -i=<AK> -k=<SK> -e=obs.cn-north-4.myhuaweicloud.com`
 > **不要把 AK/SK、sessionToken、STS 写进本仓库或任何对话。**
@@ -111,12 +116,13 @@ node skills/fmode-storage/scripts/uploader.mjs config
 
 ### 0.3.0（凭据链语义变更）
 - **真因修复**：旧版第0级调用 `POST /api/storage/credentials` 换 STS —— 该端点**从未上线（404）**（设计文档 `fmode-studio/docs/obs-cdn/04-API设计.md`，status:规划中），"登录即可上传"是伪自举
-- 字段名纠错：真实身份字段是 `~/.fmode/config/user.json` 的 **fmodeApiToken**（sk- 开头），不是 sessionToken
+- 字段名纠错：真实身份字段是 `~/.fmode/config/user.json` 的 **fmodeApiToken**（sk- 开头），不是 sessionToken（deploy STS 自举仍用 sessionToken，见下）
 - "能跑通"假象纠偏：部分环境"能跑"只是因为历史遗留的手工 obsutilconfig 存在（第1/2级回落生效），其他机器无此文件即全链死——现在全链失败时明确打印初始化向导并退出码 2，不再伪装成功
-- 凭据链重写为诚实 4 级（env → obsutil config → 平台签发(端点探测) → 项目 config），旧自举降级为 `--experimental-sts`（端点 200 才启用）
+- 凭据链重写为诚实 4 级（env → obsutil config → 平台签发 deploy STS → 项目 config），合并 deploy 权威链路 `/api/apig/deploy/huaweicloud`（sessionToken+projectId→项目隔离 STS，生产实测 200）；旧 `/api/storage/credentials` 自举降级为 `--experimental-sts`（探测 200 才启用）
 - 新增 `init` 向导（写 obsutil config 600 权限 + 技能 config 段 + 自动 test）与 `test` 自检命令
 - 端点探测结果缓存 `.sts-probe.json`（1 小时有效，已 gitignore）
 - 修复：失败判定误报（旧版 `chattri` 失败文案含 "Set the acl" 被误判成功；`OBSUTIL_CONFIG_FILE` 环境变量 obsutil 并不识别，改用 `-config=` 显式传递）；obsutil 不在 PATH 时自动按 `~/.local/bin`、`~/bin`、getpwuid home 等候选定位
+- STS 签发时上传 key 强制限定 `dev/<projectId>/` 前缀（防越权路径）
 
 ### 0.2.1
 - 修复 mjs 双 shebang 语法错误
