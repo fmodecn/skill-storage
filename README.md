@@ -37,10 +37,17 @@ cp -r skill-storage/skills/fmode-storage <你的工具技能目录>/fmode-storag
 第0级（自举）: sessionToken（FMODE_SESSION_TOKEN 环境变量
                               或 ~/.fmode/config.json 的 sessionToken
                               或 ~/.fmode/config/user.json）
-             → POST https://server.fmode.cn/api/storage/credentials
-             → STS 临时凭证 {AK, SK, SecurityToken}（作用域限定用户 prefix，短时）
+              + storageProjectId（FMODE_STORAGE_PROJECT_ID 环境变量
+                              或 ~/.fmode/config.json 的 storageProjectId
+                              或 ./.fmode/deploy.json 的 projectId；
+                              须为本人有权限的 Project objectId）
+             → POST https://server.fmode.cn/api/apig/deploy/huaweicloud
+               body {token, projectId}
+             → STS 临时凭证 {accessKey, secretKey, securityToken, obsPath}
+               obsPath = obs://nova-cloud/dev/<projectId>/（项目隔离前缀）
              → 一次性 obsutil 临时配置直传 OBS（STS 不落盘、不进日志，用完即删）
              ✅ 登录 FMODE Studio 即可上传，无需预配任何 OBS 密钥
+             ⚠️ 旧设计 /api/storage/credentials 端点不存在（404），勿用
 第1级: 环境变量 FMODE_OBS_CONF（OBS util 配置文件路径）
 第2级: ~/.fmode/config.json → obsUtilPath / obsBucket / obsEndpoint / cdnDomain
 第3级: 项目 ./.fmode/config.json → 同上

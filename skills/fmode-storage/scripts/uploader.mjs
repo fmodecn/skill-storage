@@ -3,7 +3,7 @@
  * fmode-storage uploader — 对象存储上传/公开链接/ACL
  * 零依赖（Node ≥18）。凭据按 5 级优先级自动解析，永不入库。
  *
- * 第0级（自举）：sessionToken → POST /api/storage/credentials 换 STS 临时凭证，
+ * 第0级（自举）：sessionToken + projectId → POST /api/apig/deploy/huaweicloud 换 STS 临时凭证，
  *   内存持有直传 OBS（不落盘、不进日志）。后续级为回落链（自建 OBS / 已有
  *   obsutil config 的用户不受影响）。
  *
@@ -21,11 +21,12 @@ const HOME = os.homedir();
 
 // fmode 网关基址（签发 STS / 下载 URL）
 const FMODE_API_BASE = process.env.FMODE_API_BASE || 'https://server.fmode.cn';
-// 自举 v2（权威，2026-09 实测可用）：sessionToken + projectId → STS
-// 见 fmode-studio rules/09 §4.3.4 与 future-server api/api-ncloud/apig/routes-deploy.js
+// 自举（权威，2026-09-12 生产实测 200）：sessionToken + projectId → STS
+// POST /api/apig/deploy/huaweicloud → {accessKey, secretKey, securityToken, obsPath}
+// obsPath 形如 obs://nova-cloud/dev/<projectId>/（bucket=nova-cloud, prefix=dev/<projectId>/）
+// 服务端权限链: token→用户身份 → Project.user/owner 或 ProjectTeam 三查 → 华为云委托 Agency 签发 STS
+// 注意: 旧设计中的 POST /api/storage/credentials 端点在生产**不存在**（Cannot POST 404），已移除。
 const DEPLOY_STS_URL = `${FMODE_API_BASE.replace(/\/$/, '')}/api/apig/deploy/huaweicloud`;
-// 自举 v1（历史设计，端点可能未部署；失败自动回落 v2）
-const STORAGE_CREDENTIALS_URL = `${FMODE_API_BASE.replace(/\/$/, '')}/api/storage/credentials`;
 
 /**
  * 解析 storage 专用 projectId（非密钥）。
@@ -79,13 +80,14 @@ export function resolveSessionToken() {
 }
 
 /**
- * 第0级：sessionToken → STS 临时凭证（AK/SK/SecurityToken，作用域限定用户 prefix）。
+ * 第0级：sessionToken + projectId → STS 临时凭证（AK/SK/SecurityToken，作用域限定项目 prefix）。
  *
- * 权威链路（fmode-studio/docs/obs-cdn/02-架构与路径划分.md §5.2）：
- *   sessionToken → POST /api/storage/credentials
- *                → { accessKeyId, secretAccessKey, sessionToken(即 SecurityToken),
- *                    endpoint, bucket, prefix, expiration }
+ * 权威链路（future-server api/api-ncloud/apig/routes-deploy.js，2026-09-12 生产实测 200）：
+ *   POST /api/apig/deploy/huaweicloud {token, projectId}
+ *                → { code:200, data:{ accessKey, secretKey, securityToken, obsPath } }
+ *                → obsPath "obs://nova-cloud/dev/<projectId>/" 解析出 bucket/prefix
  *                → 客户端直传 OBS
+ * 服务端权限：token→用户身份 → Project.user / Project.owner / ProjectTeam 三查。
  *
  * ⚠️ 返回的 STS 仅内存持有：不写文件、不打日志、不进错误信息。
  *
@@ -93,42 +95,7 @@ export function resolveSessionToken() {
  *           endpoint: string, bucket: string, prefix: string } | null>}
  *          签发失败返回 null（调用方回落第1-4级）。
  */
-export async function fetchStsCredentials(sessionToken) {
-  if (!sessionToken) return null;
-  try {
-    const res = await fetch(STORAGE_CREDENTIALS_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${sessionToken}`,
-      },
-      body: JSON.stringify({ op: ['put', 'delete'] }),
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) return null;
-    const body = await res.json().catch(() => null);
-    const cred = body && (body.credentials || body.data);
-    if (!cred || !cred.accessKeyId || !cred.secretAccessKey) return null;
-    return {
-      ak: cred.accessKeyId,
-      sk: cred.secretAccessKey,
-      securityToken: cred.sessionToken || cred.securityToken || '',
-      endpoint: cred.endpoint || 'obs.cn-south-1.myhuaweicloud.com',
-      bucket: cred.bucket || null,
-      prefix: cred.prefix || '',
-    };
-  } catch { /* 网络/签名失败一律回落，不泄露错误细节 */ }
-  return null;
-}
-
-/**
- * 自举 v2（权威链路）：sessionToken + projectId → POST /api/apig/deploy/huaweicloud → STS。
- * 服务端用平台自己的华为云授权签发项目隔离短时 STS，目标固定为
- *   obs://nova-cloud/dev/<projectId>/（bucket=nova-cloud, prefix=dev/<projectId>/）。
- * 返回字段映射：data.accessKey→ak, data.secretKey→sk, data.securityToken→securityToken,
- * data.obsPath→bucket/prefix 解析。成功返回对象，失败返回 null（调用方回落）。
- */
-export async function fetchStsViaDeploy(sessionToken, projectId) {
+export async function fetchStsCredentials(sessionToken, projectId) {
   if (!sessionToken || !projectId) return null;
   try {
     const res = await fetch(DEPLOY_STS_URL, {
@@ -141,19 +108,18 @@ export async function fetchStsViaDeploy(sessionToken, projectId) {
     const body = await res.json().catch(() => null);
     const data = body && body.data;
     if (!body || body.code !== 200 || !data || !data.success) return null;
-    const obsPath = String(data.obsPath || '');           // 例: obs://nova-cloud/dev/<projectId>/
+    const obsPath = String(data.obsPath || '');
     const m = obsPath.match(/^obs:\/\/([^/]+)\/(.*)\/$/);
     return {
       ak: String(data.accessKey || ''),
       sk: String(data.secretKey || ''),
       securityToken: String(data.securityToken || ''),
       expiresAt: data.expiresAt || null,
-      endpoint: 'obs.cn-south-1.myhuaweicloud.com',
+      endpoint: 'obs.cn-south-1.myhuaweicloud.com',   // nova-cloud 桶在 cn-south-1（实测 2026-09-12; north-4 会 NoSuchBucket）
       bucket: m ? m[1] : 'nova-cloud',
-      prefix: m ? m[2] : '',
-      projectId,
+      prefix: m ? m[2] + '/' : `dev/${projectId}/`,
     };
-  } catch { /* 网络失败一律回落，不泄露错误细节 */ }
+  } catch { /* 网络/签名失败一律回落，不泄露错误细节 */ }
   return null;
 }
 
@@ -177,11 +143,11 @@ export function runWithSts(sts, args, timeout = 300000) {
     '',
   ].join('\n'), { mode: 0o600 });
   try {
-    const r = spawnSync('obsutil', args, {
-      encoding: 'utf8',
-      timeout,
-      env: { ...process.env, OBSUTIL_CONFIG_FILE: cfgFile },
-    });
+    // obsutil 只认 -config=<file> 参数（不认 OBSUTIL_CONFIG_FILE 环境变量——
+    // 2026-09-12 实测：环境变量方式会静默回落默认配置导致 NoSuchBucket）。
+    // 桶级命令在位置参数后追加 -config；endpoint 已写进 config 文件。
+    const withCfg = [...args, '-config', cfgFile];
+    const r = spawnSync('obsutil', withCfg, { encoding: 'utf8', timeout });
     const out = (r.stdout || '') + (r.stderr || '');
     return { ok: /Upload successfully|Download successfully|Set the acl/i.test(out) || r.status === 0, out };
   } finally {
@@ -199,32 +165,25 @@ export async function resolveStorageConfig() {
     sts: null,       // 第0级自举得到的 STS（内存持有）
     via: null,       // 命中的解析级别（诊断用，不含任何密钥）
   };
-  // ---- 第0级自举 v2（权威）：sessionToken + projectId → deploy/huaweicloud → STS ----
+  // ---- 第0级自举（权威）：sessionToken + projectId → deploy/huaweicloud → STS ----
   const sessionToken = resolveSessionToken();
   if (sessionToken) {
     const projectId = resolveStorageProjectId();
-    if (projectId) {
-      const sts = await fetchStsViaDeploy(sessionToken, projectId);
-      if (sts) {
-        cfg.sts = sts;
-        cfg.bucket = sts.bucket || cfg.bucket;
-        cfg.endpoint = sts.endpoint || cfg.endpoint;
-        cfg.cdnDomain = process.env.FMODE_CDN_DOMAIN || 'app.fmode.cn';
-        cfg.via = 'level0v2:sessionToken+projectId->deploySTS';
-        return cfg; // 自举成功，无需回落
-      }
+    const sts = projectId ? await fetchStsCredentials(sessionToken, projectId) : null;
+    if (sts) {
+      cfg.sts = sts;
+      cfg.bucket = sts.bucket || cfg.bucket;
+      cfg.endpoint = sts.endpoint || cfg.endpoint;
+      cfg.cdnDomain = process.env.FMODE_CDN_DOMAIN || 'app.fmode.cn';
+      cfg.via = 'level0:sessionToken+projectId->deploySTS';
+      return cfg; // 自举成功，无需回落
     }
-    // v2 未命中（无 projectId 或签发失败）→ v1 历史端点
-    const sts1 = await fetchStsCredentials(sessionToken);
-    if (sts1) {
-      cfg.sts = sts1;
-      cfg.bucket = sts1.bucket || cfg.bucket;
-      cfg.endpoint = sts1.endpoint || cfg.endpoint;
-      cfg.via = 'level0v1:sessionToken->STS';
-      return cfg;
+    // 自举未命中：给出可操作的明确指引
+    if (!projectId) {
+      console.error('sessionToken 存在但缺少 storageProjectId——请设置 FMODE_STORAGE_PROJECT_ID 或在 ~/.fmode/config.json 配 storageProjectId（须为本人有权限的 Project objectId）');
+    } else {
+      console.error('sessionToken 存在但 STS 签发失败（/api/apig/deploy/huaweicloud 未 200）——token 失效或该 projectId 不属于当前用户（服务端校验 Project.user/owner/ProjectTeam 三查）');
     }
-    // sessionToken 存在但两条链路都失败：给出明确报错指向重新登录
-    console.error('sessionToken 存在但 STS 换取失败（v2 deploy 与 v1 credentials 均未命中）——sessionToken 失效或缺少 storageProjectId 配置');
     console.error('（将继续尝试第1-4级回落配置）');
   }
   // ---- 第1级：环境变量 ----

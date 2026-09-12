@@ -23,9 +23,10 @@ node <skill_dir>/scripts/uploader.mjs setacl --key reports/ --acl public-read -r
 
 ```
 ┌─ 第0级（自举，推荐）──────────────────────────────────────────┐
-│ FMODE_SESSION_TOKEN 或 ~/.fmode/config.json 的 sessionToken    │
-│   → POST https://server.fmode.cn/api/storage/credentials      │
-│   → STS 临时凭证 {AK, SK, SecurityToken}（限用户 prefix，短时）│
+│ FMODE_SESSION_TOKEN + storageProjectId                        │
+│   → POST https://server.fmode.cn/api/apig/deploy/huaweicloud  │
+│   → STS 临时凭证 {accessKey, secretKey, securityToken, obsPath}│
+│     obsPath = obs://nova-cloud/dev/<projectId>/（项目隔离）   │
 │   → 一次性 obsutil 临时配置直传 OBS（命令结束即删，不落盘）    │
 └───────────────────────────────────────────────────────────────┘
 ┌─ 回落（自建 OBS / 已有 obsutil config 的用户）────────────────┐
